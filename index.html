@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Chat - AWS-Powered Real-Time Messaging</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- AWS SDK v2 for browser; configure credentials via Cognito Identity Pool in production -->
+    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.1695.0.min.js"></script>
+    <style>
+        /* Slick dark theme with gradients and smooth transitions */
+        body { 
+            background: linear-gradient(135deg, #000000 0%, #1a1a1a 100%); 
+            color: #ffffff; 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .chat-bubble { 
+            background: linear-gradient(145deg, #2a2a2a, #1a1a1a); 
+            margin: 8px 0; 
+            padding: 12px 16px; 
+            border-radius: 18px; 
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .chat-bubble:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2); }
+        .media-preview { 
+            max-width: 200px; max-height: 200px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            transition: transform 0.3s ease;
+        }
+        .media-preview:hover { transform: scale(1.05); }
+        .sidebar-item { 
+            transition: all 0.3s ease; 
+            border-left: 3px solid transparent;
+        }
+        .sidebar-item:hover, .sidebar-item.active { 
+            background: rgba(59, 130, 246, 0.1); 
+            border-left-color: #3b82f6; 
+            transform: translateX(4px);
+        }
+        /* Mobile responsiveness */
+        @media (max-width: 768px) { 
+            .sidebar { transform: translateX(-100%); transition: transform 0.3s ease; }
+            .sidebar.open { transform: translateX(0); }
+            .chat-main { margin-left: 0 !important; }
+        }
+        /* Overlay for mobile sidebar */
+        .overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 5;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease;
+        }
+        .overlay.open {
+            opacity: 1;
+            visibility: visible;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Global config and detection for local vs AWS mode
+        // In production, set AWS credentials via environment or Cognito; here, assume IAM roles for Lambda/S3/etc.
+        const isLocal = () => window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '0.0.0.0';
+        let AWS_MODE = isLocal();
+        let wsConnection = null;
+        let currentUser = null;
+
+        // AWS Initialization (fallback to mocks if local)
+        let cognito, dynamodb, s3, apigatewaymanagementapi;
+        if (!AWS_MODE) {
+            AWS.config.update({
+                region: 'us-east-1', // Change to your region
+                credentials: new AWS.CognitoIdentityCredentials({
+                    IdentityPoolId: 'YOUR_IDENTITY_POOL_ID' // Replace with your Cognito Identity Pool ID
+                })
+            });
+            cognito = new AWS.CognitoIdentityServiceProvider();
+            dynamodb = new AWS.DynamoDB.DocumentClient();
+            s3 = new AWS.S3();
+            // For WebSockets, use API Gateway endpoint
+            // apigatewaymanagementapi = new AWS.ApiGatewayManagementApi({ endpoint: 'YOUR_WEBSOCKET_ENDPOINT' });
+        }
+
+        // Mock stores (in-memory + localStorage for persistence across sessions)
+        let mockGroups = JSON.parse(localStorage.getItem('mockGroups')) || [
+            { id: 1, name: 'General', description: 'General course discussions', members: [] },
+            { id: 2, name: 'Assignments', description: 'Assignment discussions and help', members: [] },
+            { id: 3, name: 'Cloud Architecture', description: 'Share and discuss cloud architecture diagrams', members: [] },
+            { id: 4, name: 'AWS Configurations', description: 'Share CloudFormation templates and configs', members: [] }
+        ];
+        let mockMessages = JSON.parse(localStorage.getItem('mockMessages')) || {};
+        let mockUsers = ['student1', 'student2', 'instructor']; // Demo users
+        let mockOnlineUsers = new Set();
+        let mockUploadsDir = 'uploads/'; // Local file path for media
+
+        // Persist mocks
+        const saveMocks = () => {
+            localStorage.setItem('mockGroups', JSON.stringify(mockGroups));
+            localStorage.setItem('mockMessages', JSON.stringify(mockMessages));
+        };
+
+        // One-on-one chat ID generation (sorted to ensure uniqueness)
+        const getDmChatId = (user1, user2) => [user1, user2].sort().join('_');
+
+        // WebSocket setup for real-time (AWS API Gateway WebSocket in prod, local ws server in dev)
+        const connectWebSocket = () => {
+            if (wsConnection) wsConnection.close();
+            if (AWS_MODE) {
+                wsConnection = new WebSocket('ws://localhost:8080'); // Local mock server
+            } else {
+                // In prod, connect to wss://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/prod
+                wsConnection = new WebSocket('wss://YOUR_WEBSOCKET_URL'); // Replace with your API Gateway WebSocket URL
+                // Handle AWS-specific post-connection (e.g., send @connections API call via Lambda)
+            }
+            wsConnection.onopen = () => console.log('WebSocket connected');
+            wsConnection.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                // Handle incoming message (update UI via event)
+                window.dispatchEvent(new CustomEvent('newMessage', { detail: data }));
+            };
+            wsConnection.onclose = () => setTimeout(connectWebSocket, 3000); // Reconnect
+        };
+
+        // Authentication functions
+        const authenticateUser = async (username, password) => {
+            if (AWS_MODE) {
+                // Mock: Simple username/password check for demo accounts
+                if (mockUsers.includes(username) && password === 'password123') {
+                    currentUser = username;
+                    localStorage.setItem('currentUser', username);
+                    mockOnlineUsers.add(username);
+                    connectWebSocket(); // Connect after login
+                    return { success: true, user: { username } };
+                }
+                return { success: false, error: 'Invalid credentials' };
+            } else {
+                // AWS Cognito: Initiate Auth
+                try {
+                    const params = {
+                        AuthFlow: 'USER_PASSWORD_AUTH',
+                        ClientId: 'YOUR_USER_POOL_CLIENT_ID', // Replace
+                        AuthParameters: { USERNAME: username, PASSWORD: password }
+                    };
+                    const result = await cognito.initiateAuth(params).promise();
+                    currentUser = username;
+                    localStorage.setItem('currentUser', username);
+                    connectWebSocket();
+                    return { success: true, user: { username } };
+                } catch (err) {
+                    return { success: false, error: err.message };
+                }
+            }
+        };
+
+        const logoutUser = async () => {
+            if (AWS_MODE) {
+                currentUser = null;
+                localStorage.removeItem('currentUser');
+                mockOnlineUsers.delete(currentUser);
+                if (wsConnection) wsConnection.close();
+            } else {
+                // Cognito Global Sign Out
+                try {
+                    await cognito.globalSignOut({ AccessToken: 'YOUR_TOKEN' }).promise(); // Get token from session
+                } catch (err) { console.error(err); }
+                currentUser = null;
+                localStorage.removeItem('currentUser');
+                if (wsConnection) wsConnection.close();
+            }
+        };
+
+        // Group management functions
+        const createGroup = async (name, description) => {
+            if (AWS_MODE) {
+                const newGroup = { id: Date.now(), name, description, members: [currentUser] };
+                mockGroups.push(newGroup);
+                saveMocks();
+                return newGroup;
+            } else {
+                // DynamoDB: PutItem to Groups table (partition key: groupId)
+                const params = {
+                    TableName: 'Groups',
+                    Item: { groupId: Date.now().toString(), name, description, members: [currentUser] }
+                };
+                const result = await dynamodb.put(params).promise();
+                return { id: params.Item.groupId, ...params.Item };
+            }
+        };
+
+        const getGroups = async () => {
+            if (AWS_MODE) return mockGroups;
+            // DynamoDB Scan or Query Groups table
+            const params = { TableName: 'Groups' };
+            const result = await dynamodb.scan(params).promise();
+            return result.Items;
+        };
+
+        const joinGroup = async (groupId) => {
+            if (AWS_MODE) {
+                const group = mockGroups.find(g => g.id === groupId);
+                if (group && !group.members.includes(currentUser)) {
+                    group.members.push(currentUser);
+                    saveMocks();
+                }
+                return group;
+            } else {
+                // DynamoDB UpdateItem to add user to members array
+                const params = {
+                    TableName: 'Groups',
+                    Key: { groupId },
+                    UpdateExpression: 'ADD members :user',
+                    ExpressionAttributeValues: { ':user': currentUser }
+                };
+                await dynamodb.update(params).promise();
+            }
+        };
+
+        // Message functions
+        const sendMessage = async (chatId, messageData) => {
+            const timestamp = new Date().toISOString();
+            const fullMessage = { ...messageData, user: currentUser, timestamp, chatId };
+            if (AWS_MODE) {
+                if (!mockMessages[chatId]) mockMessages[chatId] = [];
+                mockMessages[chatId].push(fullMessage);
+                saveMocks();
+                // Broadcast via local WS
+                if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+                    wsConnection.send(JSON.stringify(fullMessage));
+                }
+            } else {
+                // DynamoDB: PutItem to Messages table (partition: chatId, sort: timestamp)
+                const params = {
+                    TableName: 'Messages',
+                    Item: fullMessage
+                };
+                await dynamodb.put(params).promise();
+                // Send via API Gateway WebSocket (post to @connections)
+                // Lambda handles broadcasting to connected users in chatId
+            }
+            window.dispatchEvent(new CustomEvent('newMessage', { detail: fullMessage }));
+        };
+
+        const getMessages = async (chatId) => {
+            if (AWS_MODE) return mockMessages[chatId] || [];
+            // DynamoDB Query Messages table by chatId
+            const params = {
+                TableName: 'Messages',
+                KeyConditionExpression: 'chatId = :id',
+                ExpressionAttributeValues: { ':id': chatId }
+            };
+            const result = await dynamodb.query(params).promise();
+            return result.Items;
+        };
+
+        // Media upload functions (S3 with pre-signed URLs in prod, local fetch in dev)
+        const uploadMedia = async (file) => {
+            if (AWS_MODE) {
+                // Local upload to mock server /upload endpoint
+                const formData = new FormData();
+                formData.append('file', file);
+                try {
+                    console.log('Uploading file:', file.name);  // Debug log
+                    const response = await fetch('http://localhost:3000/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    if (!response.ok) {
+                        throw new Error(`Server error: ${response.status} ${response.statusText}`);
+                    }
+                    const data = await response.json();
+                    console.log('Upload success:', data.url);  // Debug log
+                    return data.url;
+                } catch (err) {
+                    console.error('Upload failed:', err);
+                    throw err;  // Re-throw to handle in caller
+                }
+            } else {
+                // AWS S3: Generate pre-signed URL for upload
+                const params = {
+                    Bucket: 'your-chat-media-bucket', // Replace
+                    Key: `media/${Date.now()}_${file.name}`,
+                    Expires: 300 // 5 min
+                };
+                const signedUrl = await s3.getSignedUrlPromise('putObject', params);
+                await fetch(signedUrl, {
+                    method: 'PUT',
+                    body: file,
+                    headers: { 'Content-Type': file.type }
+                });
+                // Get public/read URL or another signed get URL
+                const getParams = { ...params, Expires: 3600 };
+                return s3.getSignedUrl('getObject', getParams);
+            }
+        };
+
+        // Analytics (simple message count per group via Lambda in prod)
+        const getAnalytics = async (chatId) => {
+            if (AWS_MODE) {
+                return { messageCount: mockMessages[chatId]?.length || 0 };
+            } else {
+                // Invoke Lambda to query DynamoDB count
+                const lambda = new AWS.Lambda();
+                const params = { FunctionName: 'getMessageCount', Payload: JSON.stringify({ chatId }) };
+                const result = await lambda.invoke(params).promise();
+                return JSON.parse(result.Payload);
+            }
+        };
+
+        // Reusable Components
+        const LoginForm = ({ onLogin }) => {
+            const [username, setUsername] = useState('');
+            const [password, setPassword] = useState('');
+            const [error, setError] = useState('');
+
+            const handleSubmit = async () => {
+                const result = await authenticateUser(username, password);
+                if (result.success) {
+                    onLogin(result.user);
+                } else {
+                    setError(result.error);
+                }
+            };
+
+            return (
+                <div className="min-h-screen flex items-center justify-center bg-black">
+                    <div className="bg-gradient-to-b from-gray-900 to-black p-8 rounded-xl shadow-2xl w-96 border border-gray-700">
+                        <div className="text-center mb-8">
+                            <h1 className="text-4xl font-bold text-blue-400 mb-2">Cloud Chat</h1>
+                            <p className="text-gray-400">AWS-Powered Real-Time Messaging</p>
+                        </div>
+                        <div className="space-y-4">
+                            <input
+                                type="text"
+                                placeholder="Enter your username"
+                                value={username}
+                                onChange={(e) => setUsername(e.target.value)}
+                                className="w-full p-4 bg-gray-800 rounded-lg text-white placeholder-gray-500 border border-gray-600 focus:border-blue-500 focus:outline-none transition-colors"
+                            />
+                            <input
+                                type="password"
+                                placeholder="Enter your password"
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                className="w-full p-4 bg-gray-800 rounded-lg text-white placeholder-gray-500 border border-gray-600 focus:border-blue-500 focus:outline-none transition-colors"
+                            />
+                            {error && <p className="text-red-500 text-sm bg-red-900 p-2 rounded">{error}</p>}
+                            <button
+                                onClick={handleSubmit}
+                                className="w-full bg-gradient-to-r from-blue-500 to-blue-600 text-white p-4 rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all shadow-lg"
+                            >
+                                → Sign In
+                            </button>
+                        </div>
+                        <div className="mt-8 p-4 bg-gray-800 rounded-lg text-sm">
+                            <p className="font-bold mb-2 text-gray-300">Demo Accounts:</p>
+                            <p className="text-gray-400">student1 / password123</p>
+                            <p className="text-gray-400">student2 / password123</p>
+                            <p className="text-gray-400">instructor / password123</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const GroupList = ({ groups, selectedChat, onSelectChat, onCreateGroup, isOpen, onClose, onSelectDm }) => {
+            const [newGroupName, setNewGroupName] = useState('');
+            const [newGroupDesc, setNewGroupDesc] = useState('');
+            const [showCreateModal, setShowCreateModal] = useState(false);
+            const [showDmModal, setShowDmModal] = useState(false);
+
+            const handleCreate = async () => {
+                if (newGroupName) {
+                    const group = await createGroup(newGroupName, newGroupDesc || 'New group description');
+                    onCreateGroup(group);
+                    setNewGroupName('');
+                    setNewGroupDesc('');
+                    setShowCreateModal(false);
+                }
+            };
+
+            const handleDmSelect = (otherUser) => {
+                const chatId = getDmChatId(currentUser, otherUser);
+                onSelectDm(otherUser, chatId);
+                setShowDmModal(false);
+                if (onClose && window.innerWidth < 768) onClose(); // Close sidebar on mobile
+            };
+
+            return (
+                <>
+                    <div className={`sidebar w-64 bg-gradient-to-b from-gray-900 to-gray-800 p-4 space-y-4 shadow-2xl fixed top-16 left-0 h-[calc(100vh-4rem)] z-20 transform transition-transform duration-300 ease-in-out ${isOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+                        <div className="flex space-x-2 mb-4">
+                            <button onClick={() => setShowCreateModal(true)} className="flex-1 bg-gradient-to-r from-blue-500 to-blue-600 text-white p-3 rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all shadow-md">+ New Group</button>
+                            <button onClick={() => setShowDmModal(true)} className="flex-1 bg-gradient-to-r from-green-500 to-green-600 text-white p-3 rounded-lg hover:from-green-600 hover:to-green-700 transition-all shadow-md">👤 DM</button>
+                        </div>
+                        <div className="space-y-2 max-h-[calc(100vh-200px)] overflow-y-auto">
+                            {groups.map(group => (
+                                <div
+                                    key={group.id}
+                                    onClick={() => {
+                                        onSelectChat(group.id, 'group', group.name);
+                                        if (onClose && window.innerWidth < 768) onClose(); // Close on mobile
+                                    }}
+                                    className={`sidebar-item p-4 rounded-lg cursor-pointer ${selectedChat.id === group.id ? 'active bg-blue-900/20' : 'hover:bg-gray-700/50'}`}
+                                >
+                                    <p className="font-bold text-sm">{group.name}</p>
+                                    <p className="text-xs text-gray-400 truncate">{group.description}</p>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="absolute bottom-4 left-4 text-xs text-gray-500 opacity-75">
+                            <p>S3 • DynamoDB • API Gateway • Lambda</p>
+                        </div>
+                    </div>
+                    {/* Mobile Overlay */}
+                    {!window.innerWidth >= 768 && isOpen && <div className={`overlay ${isOpen ? 'open' : ''}`} onClick={onClose} />}
+                    {/* Create Group Modal */}
+                    {showCreateModal && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-30 p-4">
+                            <div className="bg-gray-800 p-6 rounded-xl w-full max-w-md">
+                                <h3 className="text-lg font-bold mb-4">Create New Group</h3>
+                                <input
+                                    type="text"
+                                    placeholder="Group Name"
+                                    value={newGroupName}
+                                    onChange={(e) => setNewGroupName(e.target.value)}
+                                    className="w-full p-3 bg-gray-700 rounded mb-3 text-white"
+                                />
+                                <input
+                                    type="text"
+                                    placeholder="Description (optional)"
+                                    value={newGroupDesc}
+                                    onChange={(e) => setNewGroupDesc(e.target.value)}
+                                    className="w-full p-3 bg-gray-700 rounded mb-3 text-white"
+                                />
+                                <div className="flex space-x-2">
+                                    <button onClick={handleCreate} className="flex-1 bg-blue-500 text-white p-2 rounded">Create</button>
+                                    <button onClick={() => setShowCreateModal(false)} className="flex-1 bg-gray-600 text-white p-2 rounded">Cancel</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    {/* DM Selection Modal */}
+                    {showDmModal && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-30 p-4">
+                            <div className="bg-gray-800 p-6 rounded-xl w-full max-w-md">
+                                <h3 className="text-lg font-bold mb-4">Start DM</h3>
+                                <div className="space-y-2 max-h-48 overflow-y-auto">
+                                    {mockUsers.filter(u => u !== currentUser).map(user => (
+                                        <button
+                                            key={user}
+                                            onClick={() => handleDmSelect(user)}
+                                            className="w-full p-3 bg-gray-700 rounded hover:bg-gray-600 text-left transition-colors"
+                                        >
+                                            {user}
+                                        </button>
+                                    ))}
+                                </div>
+                                <button onClick={() => setShowDmModal(false)} className="w-full mt-4 bg-gray-600 text-white p-2 rounded">Cancel</button>
+                            </div>
+                        </div>
+                    )}
+                </>
+            );
+        };
+
+        const ChatWindow = ({ chat, messages, onSendMessage, analytics }) => {
+            const [input, setInput] = useState('');
+            const [file, setFile] = useState(null);
+            const messagesEndRef = useRef(null);
+
+            const scrollToBottom = () => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            };
+
+            useEffect(() => {
+                scrollToBottom();
+            }, [messages]);
+
+            const handleSend = async () => {
+                if (input.trim() || file) {
+                    let mediaUrl = null;
+                    if (file) {
+                        try {
+                            mediaUrl = await uploadMedia(file);
+                        } catch (err) {
+                            alert('Upload failed: ' + err.message);
+                            console.error('Upload failed:', err);
+                            return;
+                        }
+                    }
+                    await onSendMessage({
+                        text: input,
+                        type: file ? 'media' : 'text',
+                        mediaUrl,
+                        mediaType: file?.type
+                    });
+                    setInput('');
+                    setFile(null);
+                }
+            };
+
+            const handleFileChange = (e) => {
+                setFile(e.target.files[0]);
+            };
+
+            return (
+                <div className="flex-1 flex flex-col bg-gray-900">
+                    <div className="bg-gradient-to-r from-blue-900 to-blue-800 p-4 flex justify-between items-center shadow-md">
+                        <h2 className="text-xl font-bold">{chat.name}</h2>
+                        <span className="text-gray-300 bg-blue-800 px-2 py-1 rounded text-sm">Messages: {analytics.messageCount}</span>
+                    </div>
+                    <div className="flex-1 p-4 overflow-y-auto space-y-4 bg-black">
+                        {messages.map((msg, idx) => (
+                            <div key={idx} className={`flex ${msg.user === currentUser ? 'justify-end' : 'justify-start'}`}>
+                                <div className={`chat-bubble max-w-xs ${msg.user === currentUser ? 'bg-blue-900/20' : 'bg-gray-800/50'}`}>
+                                    {msg.type === 'text' && <p className="text-sm">{msg.text}</p>}
+                                    {msg.type === 'media' && (
+                                        <div className="space-y-2">
+                                            {msg.mediaType?.startsWith('image/') && (
+                                                <img src={msg.mediaUrl} alt="Shared" className="media-preview w-full" />
+                                            )}
+                                            {msg.mediaType?.startsWith('video/') && (
+                                                <video src={msg.mediaUrl} controls className="media-preview w-full rounded" />
+                                            )}
+                                            {msg.mediaType?.startsWith('application/') && (
+                                                <a href={msg.mediaUrl} download className="block text-blue-400 underline text-sm">📎 Download {msg.mediaUrl.split('/').pop()}</a>
+                                            )}
+                                            {(msg.mediaUrl?.endsWith('.yaml') || msg.mediaUrl?.endsWith('.json')) && (
+                                                <p className="text-green-400 text-sm">CloudFormation Template: {msg.mediaUrl.split('/').pop()}</p>
+                                            )}
+                                        </div>
+                                    )}
+                                    <p className="text-xs text-gray-500 mt-2 text-right">{new Date(msg.timestamp).toLocaleTimeString()}</p>
+                                </div>
+                            </div>
+                        ))}
+                        <div ref={messagesEndRef} />
+                    </div>
+                    <div className="p-4 bg-gray-800 flex space-x-2 items-center">
+                        <button className="p-2 text-gray-400 hover:text-white transition-colors">😀</button>
+                        <label className="p-2 text-gray-400 cursor-pointer hover:text-white transition-colors">📎
+                            <input type="file" onChange={handleFileChange} className="hidden" accept="image/*,video/*,application/pdf,.yaml,.json" />
+                        </label>
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={(e) => setInput(e.target.value)}
+                            onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+                            placeholder="Type your message..."
+                            className="flex-1 p-3 bg-gray-700 rounded-lg border border-gray-600 focus:border-blue-500 focus:outline-none text-white"
+                        />
+                        <button onClick={handleSend} className="p-3 bg-gradient-to-r from-blue-500 to-blue-600 rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all">Send</button>
+                    </div>
+                </div>
+            );
+        };
+
+        const UserStatus = ({ user, onLogout, onToggleAnalytics, onToggleSidebar }) => (
+            <div className="bg-gradient-to-r from-blue-900 to-blue-800 p-4 flex items-center justify-between shadow-lg">
+                <button onClick={onToggleSidebar} className="text-white mr-4 hover:scale-110 transition-transform w-6 h-6">
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+                    </svg>
+                </button>
+                <span className="text-lg font-semibold flex items-center">Cloud Chat {user.username}</span>
+                <div className="space-x-4 flex items-center">
+                    <button onClick={onToggleAnalytics} className="text-white hover:text-blue-300 transition-colors">📊 Analytics</button>
+                    <button onClick={onLogout} className="text-white underline hover:text-red-300 transition-colors">Logout</button>
+                </div>
+            </div>
+        );    
+
+        const AnalyticsPanel = ({ selectedChat, isOpen }) => {
+            const [analytics, setAnalytics] = useState({ messageCount: 0 });
+
+            useEffect(() => {
+                if (selectedChat) {
+                    getAnalytics(selectedChat.id).then(setAnalytics);
+                }
+            }, [selectedChat]);
+
+            return (
+                <div className={`w-64 bg-gradient-to-b from-gray-900 to-gray-800 p-4 shadow-2xl fixed top-16 right-0 h-[calc(100vh-4rem)] z-10 transform transition-transform duration-300 ease-in-out ${isOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+                    <h3 className="font-bold text-blue-400 mb-4 text-lg flex items-center">📈 Analytics</h3>
+                    <div className="space-y-4 text-sm">
+                        <p className="bg-gray-700 p-4 rounded-lg">Messages: <span className="font-bold text-green-400 block text-lg">{analytics.messageCount}</span></p>
+                        {/* Add more via Lambda later */}
+                        <button className="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition-colors">Refresh</button>
+                    </div>
+                </div>
+            );
+        };
+
+        // Main App Component
+        const CloudChatApp = () => {
+            const [user, setUser] = useState(localStorage.getItem('currentUser') || null);
+            const [groups, setGroups] = useState([]);
+            const [selectedChat, setSelectedChat] = useState({ id: 1, name: 'General', type: 'group' });
+            const [messages, setMessages] = useState([]);
+            const [showAnalytics, setShowAnalytics] = useState(false);
+            const [showSidebar, setShowSidebar] = useState(window.innerWidth >= 768); // Open by default on desktop
+
+            useEffect(() => {
+                if (user) {
+                    getGroups().then(setGroups);
+                    loadMessages();
+                    if (AWS_MODE) connectWebSocket();
+                }
+            }, [user]);
+
+            useEffect(() => {
+                if (selectedChat) loadMessages();
+            }, [selectedChat]);
+
+            useEffect(() => {
+                const handleNewMessage = (e) => {
+                    if (e.detail.chatId === selectedChat.id) {
+                        loadMessages();
+                    }
+                };
+                window.addEventListener('newMessage', handleNewMessage);
+                return () => window.removeEventListener('newMessage', handleNewMessage);
+            }, [selectedChat]);
+
+            useEffect(() => {
+                const handleResize = () => {
+                    setShowSidebar(window.innerWidth >= 768);
+                };
+                window.addEventListener('resize', handleResize);
+                return () => window.removeEventListener('resize', handleResize);
+            }, []);
+
+            const loadMessages = async () => {
+                const msgs = await getMessages(selectedChat.id);
+                setMessages(msgs.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)));
+            };
+
+            const handleLogin = (loggedUser) => {
+                setUser(loggedUser);
+            };
+
+            const handleLogout = () => {
+                logoutUser();
+                setUser(null);
+                setShowSidebar(window.innerWidth >= 768);
+            };
+
+            const handleSelectChat = (id, type, name) => {
+                setSelectedChat({ id, type, name });
+            };
+
+            const handleSelectDm = (otherUser, chatId) => {
+                setSelectedChat({ id: chatId, name: otherUser, type: 'dm' });
+            };
+
+            const handleCreateGroup = async (group) => {
+                setGroups([...groups, group]);
+                handleSelectChat(group.id, 'group', group.name);
+            };
+
+            const handleSendMessage = async (msgData) => {
+                await sendMessage(selectedChat.id, msgData);
+            };
+
+            const handleToggleAnalytics = () => {
+                setShowAnalytics(!showAnalytics);
+            };
+
+            const handleToggleSidebar = () => {
+                setShowSidebar(!showSidebar);
+            };
+
+            const handleCloseSidebar = () => {
+                setShowSidebar(false);
+            };
+
+            if (!user) {
+                return <LoginForm onLogin={handleLogin} />;
+            }
+
+            return (
+                <div className="h-screen flex flex-col bg-black overflow-hidden">
+                    <UserStatus 
+                        user={user} 
+                        onLogout={handleLogout}
+                        onToggleAnalytics={handleToggleAnalytics}
+                        onToggleSidebar={handleToggleSidebar}
+                    />
+                    <div className={`flex flex-1 transition-all duration-300 overflow-hidden relative ${showSidebar ? 'pl-64 md:pl-64' : ''} ${showAnalytics ? 'pr-64 md:pr-64' : ''}`}>
+                        <GroupList
+                            groups={groups}
+                            selectedChat={selectedChat}
+                            onSelectChat={handleSelectChat}
+                            onCreateGroup={handleCreateGroup}
+                            onSelectDm={handleSelectDm}
+                            isOpen={showSidebar}
+                            onClose={handleCloseSidebar}
+                        />
+                        <ChatWindow
+                            chat={selectedChat}
+                            messages={messages}
+                            onSendMessage={handleSendMessage}
+                            analytics={{ messageCount: messages.length }}
+                        />
+                        {showAnalytics && <AnalyticsPanel selectedChat={selectedChat} isOpen={showAnalytics} />}
+                    </div>
+                </div>
+            );
+        };
+
+        // Render
+        ReactDOM.render(<CloudChatApp />, document.getElementById('root'));
+    </script>
+</body>
+</html>
