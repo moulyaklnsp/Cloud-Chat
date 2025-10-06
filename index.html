@@ -75,7 +75,7 @@
         // Global config and detection for local vs AWS mode
         // In production, set AWS credentials via environment or Cognito; here, assume IAM roles for Lambda/S3/etc.
         const isLocal = () => window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '0.0.0.0';
-        let AWS_MODE = isLocal();
+        let AWS_MODE = true;
         let wsConnection = null;
         let currentUser = null;
 
